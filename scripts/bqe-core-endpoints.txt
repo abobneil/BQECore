@@ -1,0 +1,36 @@
+# One BQE Core endpoint per line.
+# Lines starting with # are ignored.
+#
+# Keep this list to top-level list endpoints that support GET collection reads.
+# The exporter writes one JSON file per endpoint.
+#
+# Document note:
+# - `document` exports the document metadata list.
+# - Use `--download-document-files` to also download document binaries.
+
+activity
+allocation
+bill
+check
+client
+company
+document
+employee
+feeschedule
+invoice
+payment
+project
+resourceschedule
+timeentry
+hr/benefit
+hr/employeebenefit
+hr/employeebenefitusage
+hr/journal
+hr/journaltype
+hr/question
+hr/review
+hr/reviewtemplate
+crm/lists/leadsource
+crm/prospect
+crm/lists/region
+crm/lists/score

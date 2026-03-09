@@ -1,0 +1,20 @@
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.24.2
+    hooks:
+      - id: gitleaks
+        args:
+          - --config=.gitleaks.toml
+
+  - repo: local
+    hooks:
+      - id: prevent-sensitive-content
+        name: Prevent sensitive content
+        entry: pwsh -NoLogo -NoProfile -File scripts/prevent-sensitive-content.ps1 -StagedOnly
+        language: system
+        pass_filenames: false
+      - id: pii-guard
+        name: Detect likely PII content
+        entry: python scripts/pii-guard.py --staged-only --update-gitignore --untrack-detected
+        language: system
+        pass_filenames: false

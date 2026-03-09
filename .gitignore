@@ -1,0 +1,48 @@
+# Secrets and local environment files
+.env
+.env.*
+!.env.example
+.envrc
+.direnv/
+
+# Private keys, certificates, and credential stores
+*.pem
+*.key
+*.pfx
+*.p12
+*.jks
+*.keystore
+*.kdbx
+*.ovpn
+*.gpg
+*.pgp
+*.publishsettings
+*.tfstate
+*.tfstate.*
+*.tfvars
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+
+# Common cloud and local credential folders
+.aws/
+.azure/
+.gcloud/
+
+# Common export and backup folders
+exports/
+dumps/
+backups/
+
+# Editor, OS, and diagnostic noise
+.idea/
+.vscode/
+__pycache__/
+*.py[cod]
+*.log
+*.suo
+*.user
+Thumbs.db
+.DS_Store
+

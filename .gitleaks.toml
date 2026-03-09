@@ -1,0 +1,17 @@
+title = "BQECore leak detection policy"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "ado-net-connection-string-with-password"
+description = "ADO.NET connection strings with inline passwords are not allowed"
+regex = '''(?i)(data source|server)\s*=\s*[^;\r\n]+;[^\r\n]*(user id|uid)\s*=\s*[^;\r\n]+;[^\r\n]*(password|pwd)\s*=\s*[^;\r\n]+'''
+tags = ["config", "secret"]
+
+[[rules]]
+id = "possible-us-ssn"
+description = "Possible U.S. Social Security number"
+regex = '''\b(?!000|666|9\d\d)\d{3}[- ]?(?!00)\d{2}[- ]?(?!0000)\d{4}\b'''
+path = '''(?i)\.(cs|config|conf|csv|json|md|ps1|sql|txt|xml|yaml|yml)$'''
+tags = ["pii", "ssn"]
