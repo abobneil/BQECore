@@ -20,7 +20,7 @@ from typing import Any
 
 IDENTITY_BASE_URL = "https://api-identity.bqecore.com/idp"
 DEFAULT_API_BASE_URL = "https://api.bqecore.com/api"
-DEFAULT_SCOPE = "read:core openid offline_access"
+DEFAULT_SCOPE = "read:core offline_access"
 DEFAULT_PAGE_SIZE = 1000
 DEFAULT_TIMEOUT_SECONDS = 120
 DEFAULT_USER_AGENT = "bqe-core-exporter/1.0"
