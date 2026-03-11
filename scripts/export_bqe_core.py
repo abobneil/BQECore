@@ -13,7 +13,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +25,10 @@ DEFAULT_PAGE_SIZE = 1000
 DEFAULT_TIMEOUT_SECONDS = 120
 DEFAULT_USER_AGENT = "bqe-core-exporter/1.0"
 DEFAULT_TOKEN_CACHE = Path.home() / ".bqe_core_export_tokens.json"
+DEFAULT_INCREMENTAL_STATE_FILE = Path("exports") / "bqe-core-incremental-state.json"
+DEFAULT_INCREMENTAL_OVERLAP_SECONDS = 300
+DEFAULT_INCREMENTAL_FIELD = "lastUpdated"
+DELETED_HISTORY_ENDPOINT = "deletedhistory"
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 DEFAULT_ENDPOINTS = [
     "activity",
@@ -54,6 +58,19 @@ DEFAULT_ENDPOINTS = [
     "crm/lists/region",
     "crm/lists/score",
 ]
+NON_INCREMENTAL_DEFAULT_ENDPOINTS = {
+    "crm/lists/leadsource",
+    "crm/lists/region",
+    "crm/lists/score",
+}
+DEFAULT_INCREMENTAL_FIELDS: dict[str, str | None] = {
+    endpoint: DEFAULT_INCREMENTAL_FIELD
+    for endpoint in DEFAULT_ENDPOINTS
+    if endpoint not in NON_INCREMENTAL_DEFAULT_ENDPOINTS
+}
+for _endpoint in NON_INCREMENTAL_DEFAULT_ENDPOINTS:
+    DEFAULT_INCREMENTAL_FIELDS[_endpoint] = None
+DEFAULT_INCREMENTAL_FIELDS[DELETED_HISTORY_ENDPOINT] = "deletedOn"
 
 
 class ExportError(RuntimeError):
@@ -131,6 +148,44 @@ class TokenStore:
     def save(self, tokens: OAuthTokens) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(tokens.to_dict(), indent=2), encoding="utf-8")
+
+
+class IncrementalStateStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def load(self) -> dict[str, Any]:
+        default_state = {
+            "version": 1,
+            "updatedAt": None,
+            "endpoints": {},
+        }
+        if not self.path.exists():
+            return default_state
+        payload = json.loads(self.path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ExportError(f"Incremental state file must contain a JSON object: {self.path}")
+        endpoints = payload.get("endpoints")
+        if not isinstance(endpoints, dict):
+            endpoints = {}
+        return {
+            "version": 1,
+            "updatedAt": payload.get("updatedAt"),
+            "endpoints": endpoints,
+        }
+
+    def save(self, state: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+@dataclass
+class EndpointExportOptions:
+    fields: str | None
+    where: str | None
+    order_by: str | None
+    expand: str | None
+    incremental_summary: dict[str, Any] | None = None
 
 
 class JsonArrayWriter:
@@ -278,8 +333,12 @@ class BQECoreExporter:
         self.output_dir = Path(args.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.token_store = TokenStore(Path(args.token_cache))
+        self.incremental_state_store = IncrementalStateStore(Path(args.incremental_state_file))
         self.tokens: OAuthTokens | None = None
         self.document_downloads: list[dict[str, Any]] = []
+        self.incremental_state = self.incremental_state_store.load()
+        self.incremental_field_map = _build_incremental_field_map(args)
+        self.auto_added_endpoints = set(getattr(args, "auto_added_endpoints", []))
         self.client = BQEHttpClient(
             timeout_seconds=args.request_timeout,
             user_agent=DEFAULT_USER_AGENT,
@@ -296,6 +355,13 @@ class BQECoreExporter:
             "downloadDocumentFiles": self.args.download_document_files,
             "endpoints": [],
         }
+        if self.args.incremental:
+            summary["incremental"] = {
+                "enabled": True,
+                "stateFile": str(self.incremental_state_store.path.resolve()),
+                "overlapSeconds": self.args.incremental_overlap_seconds,
+                "autoDeletedHistory": not self.args.no_incremental_deletes,
+            }
 
         for endpoint in endpoints:
             try:
@@ -334,9 +400,11 @@ class BQECoreExporter:
         page_number = 1
         total_records = 0
         pages_fetched = 0
+        export_options = self._build_endpoint_export_options(endpoint)
+        max_watermark_value: str | None = None
         try:
             while True:
-                query = self._build_query(page_number)
+                query = self._build_query(page_number, export_options)
                 response = self.client.get_json(_join_url(self._api_base_url(), endpoint), query=query)
                 if response.status_code == 204:
                     break
@@ -347,6 +415,11 @@ class BQECoreExporter:
                 writer.write_records(records)
                 total_records += len(records)
                 pages_fetched += 1
+                max_watermark_value = self._max_endpoint_watermark(
+                    max_watermark_value,
+                    records,
+                    export_options.incremental_summary,
+                )
                 if self.args.download_document_files and endpoint == "document":
                     self._download_documents(records)
                 if not is_collection or len(records) < self.args.page_size:
@@ -355,25 +428,153 @@ class BQECoreExporter:
         finally:
             writer.close()
 
-        return {
+        endpoint_summary: dict[str, Any] = {
             "endpoint": endpoint,
             "status": "completed",
             "file": file_name,
             "records": total_records,
             "pages": pages_fetched,
         }
+        if endpoint in self.auto_added_endpoints:
+            endpoint_summary["autoAdded"] = True
+        if export_options.incremental_summary:
+            incremental_summary = dict(export_options.incremental_summary)
+            checkpoint_value = self._update_incremental_checkpoint(
+                endpoint,
+                incremental_summary,
+                max_watermark_value,
+            )
+            if checkpoint_value:
+                incremental_summary["savedWatermark"] = checkpoint_value
+            endpoint_summary["incremental"] = incremental_summary
+        return endpoint_summary
 
-    def _build_query(self, page_number: int) -> dict[str, str]:
+    def _build_query(self, page_number: int, options: EndpointExportOptions) -> dict[str, str]:
         query = {"page": f"{page_number},{self.args.page_size}"}
-        if self.args.fields:
-            query["fields"] = self.args.fields
-        if self.args.where:
-            query["where"] = self.args.where
-        if self.args.order_by:
-            query["orderBy"] = self.args.order_by
-        if self.args.expand:
-            query["expand"] = self.args.expand
+        if options.fields:
+            query["fields"] = options.fields
+        if options.where:
+            query["where"] = options.where
+        if options.order_by:
+            query["orderBy"] = options.order_by
+        if options.expand:
+            query["expand"] = options.expand
         return query
+
+    def _build_endpoint_export_options(self, endpoint: str) -> EndpointExportOptions:
+        fields = self.args.fields
+        where = self.args.where
+        order_by = self.args.order_by
+        expand = self.args.expand
+
+        if endpoint in self.auto_added_endpoints:
+            fields = None
+            where = None
+            order_by = None
+            expand = None
+
+        if not self.args.incremental:
+            return EndpointExportOptions(fields=fields, where=where, order_by=order_by, expand=expand)
+
+        incremental_field = self._get_incremental_field(endpoint)
+        if not incremental_field:
+            return EndpointExportOptions(
+                fields=fields,
+                where=where,
+                order_by=order_by,
+                expand=expand,
+                incremental_summary={
+                    "enabled": False,
+                    "mode": "full",
+                    "reason": "No incremental watermark field is configured for this endpoint.",
+                },
+            )
+
+        state_entry = self.incremental_state.get("endpoints", {}).get(endpoint, {})
+        previous_watermark = state_entry.get("watermarkValue") or self.args.incremental_start
+        query_watermark = None
+        mode = "full"
+        reason = "No saved checkpoint found; exporting the full endpoint to seed incremental state."
+        if previous_watermark:
+            shifted_watermark = _shift_watermark(previous_watermark, self.args.incremental_overlap_seconds)
+            query_watermark = shifted_watermark or previous_watermark
+            where = _combine_where_clause(where, f"{incremental_field} >= '{query_watermark}'")
+            mode = "incremental"
+            reason = None
+        if not order_by:
+            order_by = f"{incremental_field} asc"
+
+        incremental_summary: dict[str, Any] = {
+            "enabled": True,
+            "mode": mode,
+            "field": incremental_field,
+            "stateFile": str(self.incremental_state_store.path.resolve()),
+        }
+        if previous_watermark:
+            incremental_summary["previousWatermark"] = previous_watermark
+        if query_watermark:
+            incremental_summary["queryWatermark"] = query_watermark
+        if reason:
+            incremental_summary["reason"] = reason
+
+        return EndpointExportOptions(
+            fields=fields,
+            where=where,
+            order_by=order_by,
+            expand=expand,
+            incremental_summary=incremental_summary,
+        )
+
+    def _get_incremental_field(self, endpoint: str) -> str | None:
+        normalized_endpoint = endpoint.strip().strip("/")
+        if normalized_endpoint in self.incremental_field_map:
+            return self.incremental_field_map[normalized_endpoint]
+        return self.args.incremental_default_field
+
+    def _max_endpoint_watermark(
+        self,
+        current_value: str | None,
+        records: list[Any],
+        incremental_summary: dict[str, Any] | None,
+    ) -> str | None:
+        if not incremental_summary or not incremental_summary.get("enabled"):
+            return current_value
+        field = incremental_summary.get("field")
+        if not field:
+            return current_value
+        max_value = current_value
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            watermark_value = _normalize_watermark_value(record.get(field))
+            max_value = _later_watermark(max_value, watermark_value)
+        return max_value
+
+    def _update_incremental_checkpoint(
+        self,
+        endpoint: str,
+        incremental_summary: dict[str, Any],
+        max_watermark_value: str | None,
+    ) -> str | None:
+        if not incremental_summary.get("enabled"):
+            return None
+        field = incremental_summary.get("field")
+        if not field:
+            return None
+        previous_watermark = incremental_summary.get("previousWatermark")
+        checkpoint_value = _later_watermark(previous_watermark, max_watermark_value)
+        if checkpoint_value is None:
+            checkpoint_value = _format_bqe_datetime(datetime.now(timezone.utc))
+        completed_at = _utc_now()
+        endpoints = self.incremental_state.setdefault("endpoints", {})
+        endpoints[endpoint] = {
+            "watermarkField": field,
+            "watermarkValue": checkpoint_value,
+            "updatedAt": completed_at,
+        }
+        self.incremental_state["updatedAt"] = completed_at
+        self.incremental_state_store.save(self.incremental_state)
+        return checkpoint_value
 
     def _download_documents(self, records: list[Any]) -> None:
         document_dir = self.output_dir / "document_files"
@@ -536,6 +737,23 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--where")
     parser.add_argument("--order-by")
     parser.add_argument("--expand")
+    parser.add_argument("--incremental", action="store_true")
+    parser.add_argument(
+        "--incremental-state-file",
+        default=os.getenv("BQE_CORE_INCREMENTAL_STATE_FILE", str(DEFAULT_INCREMENTAL_STATE_FILE)),
+    )
+    parser.add_argument("--incremental-start")
+    parser.add_argument(
+        "--incremental-overlap-seconds",
+        type=int,
+        default=DEFAULT_INCREMENTAL_OVERLAP_SECONDS,
+    )
+    parser.add_argument(
+        "--incremental-default-field",
+        default=DEFAULT_INCREMENTAL_FIELD,
+    )
+    parser.add_argument("--incremental-field", action="append", default=[])
+    parser.add_argument("--no-incremental-deletes", action="store_true")
     parser.add_argument("--download-document-files", action="store_true")
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
@@ -572,8 +790,44 @@ def _load_endpoints(args: argparse.Namespace) -> list[str]:
     return unique_endpoints
 
 
+def _apply_incremental_endpoint_defaults(args: argparse.Namespace, endpoints: list[str]) -> list[str]:
+    if not args.incremental or args.no_incremental_deletes:
+        setattr(args, "auto_added_endpoints", [])
+        return endpoints
+    auto_added_endpoints: list[str] = []
+    if DELETED_HISTORY_ENDPOINT not in endpoints:
+        endpoints = [*endpoints, DELETED_HISTORY_ENDPOINT]
+        auto_added_endpoints.append(DELETED_HISTORY_ENDPOINT)
+    setattr(args, "auto_added_endpoints", auto_added_endpoints)
+    return endpoints
+
+
 def _normalize_base_url(value: str) -> str:
     return value.rstrip("/")
+
+
+def _build_incremental_field_map(args: argparse.Namespace) -> dict[str, str | None]:
+    field_map = dict(DEFAULT_INCREMENTAL_FIELDS)
+    for item in args.incremental_field:
+        endpoint, field = _parse_incremental_field_override(item)
+        field_map[endpoint] = field
+    return field_map
+
+
+def _parse_incremental_field_override(value: str) -> tuple[str, str | None]:
+    for separator in ("=", ":"):
+        if separator in value:
+            endpoint, field = value.split(separator, 1)
+            normalized_endpoint = endpoint.strip().strip("/")
+            normalized_field = field.strip()
+            if not normalized_endpoint:
+                break
+            if normalized_field.lower() in {"", "none", "off", "disabled"}:
+                return normalized_endpoint, None
+            return normalized_endpoint, normalized_field
+    raise ExportError(
+        "--incremental-field values must use endpoint=field syntax, for example invoice=lastUpdated."
+    )
 
 
 def _join_url(base_url: str, path: str) -> str:
@@ -652,6 +906,61 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _format_bqe_datetime(value: datetime) -> str:
+    utc_value = value.astimezone(timezone.utc).replace(microsecond=0, tzinfo=None)
+    return utc_value.isoformat(timespec="seconds")
+
+
+def _parse_iso_datetime(value: str) -> datetime | None:
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _normalize_watermark_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    parsed = _parse_iso_datetime(str(value))
+    if parsed is None:
+        return None
+    return _format_bqe_datetime(parsed)
+
+
+def _shift_watermark(value: str, overlap_seconds: int) -> str | None:
+    parsed = _parse_iso_datetime(value)
+    if parsed is None:
+        return None
+    shifted = parsed - timedelta(seconds=max(0, overlap_seconds))
+    return _format_bqe_datetime(shifted)
+
+
+def _later_watermark(first_value: str | None, second_value: str | None) -> str | None:
+    first_parsed = _parse_iso_datetime(first_value) if first_value else None
+    second_parsed = _parse_iso_datetime(second_value) if second_value else None
+    if first_parsed and second_parsed:
+        return _format_bqe_datetime(max(first_parsed, second_parsed))
+    if second_parsed:
+        return _format_bqe_datetime(second_parsed)
+    if first_parsed:
+        return _format_bqe_datetime(first_parsed)
+    return first_value or second_value
+
+
+def _combine_where_clause(existing_clause: str | None, extra_clause: str) -> str:
+    if existing_clause:
+        return f"{existing_clause} AND {extra_clause}"
+    return extra_clause
+
+
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
@@ -662,7 +971,11 @@ def main() -> int:
     if args.page_size < 1:
         raise ExportError("--page-size must be greater than zero.")
 
+    if args.incremental_overlap_seconds < 0:
+        raise ExportError("--incremental-overlap-seconds must be zero or greater.")
+
     endpoints = _load_endpoints(args)
+    endpoints = _apply_incremental_endpoint_defaults(args, endpoints)
     if not endpoints:
         raise ExportError("No endpoints were selected for export.")
 

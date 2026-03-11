@@ -190,6 +190,37 @@ Useful examples:
 .\scripts\run-bqe-core-export.ps1 -FailFast
 ```
 
+### Incremental exports after the first run
+
+The exporter now supports checkpoint-based incremental exports.
+
+- Most endpoints use `lastUpdated` as the watermark field.
+- Incremental runs save checkpoints in `exports\bqe-core-incremental-state.json` by default.
+- Incremental runs also add the `deletedhistory` endpoint automatically so you can track deletes.
+- The CRM list endpoints (`crm/lists/leadsource`, `crm/lists/region`, and `crm/lists/score`) do not expose a documented timestamp field, so they still run as full exports unless you override the behavior.
+
+To seed the checkpoint file from a full export and use it for later runs:
+
+```powershell
+.\scripts\run-bqe-core-export.ps1 -Incremental
+```
+
+Run the same command again later and the exporter requests only records changed since the saved checkpoint, with a small overlap window to avoid missing edge-case updates.
+
+Useful incremental examples:
+
+```powershell
+.\scripts\run-bqe-core-export.ps1 -Incremental -IncrementalOverlapSeconds 600
+```
+
+```powershell
+.\scripts\run-bqe-core-export.ps1 -Incremental -IncrementalStart 2026-03-01T00:00:00
+```
+
+```powershell
+.\scripts\run-bqe-core-export.ps1 -Incremental -IncrementalField customlist=createdOn
+```
+
 ### Option B: run the Python exporter directly
 
 ```powershell
@@ -206,6 +237,31 @@ python scripts/export_bqe_core.py `
   --endpoint project `
   --endpoint invoice `
   --output-dir exports\sample-export
+```
+
+Incremental examples with the Python exporter:
+
+```powershell
+python scripts/export_bqe_core.py `
+  --incremental `
+  --endpoint invoice `
+  --output-dir exports\invoice-delta
+```
+
+```powershell
+python scripts/export_bqe_core.py `
+  --incremental `
+  --incremental-start 2026-03-01T00:00:00 `
+  --endpoint timeentry `
+  --output-dir exports\timeentry-delta
+```
+
+```powershell
+python scripts/export_bqe_core.py `
+  --incremental `
+  --incremental-field customlist=createdOn `
+  --endpoint customlist `
+  --output-dir exports\customlist-delta
 ```
 
 ## 8. How API calls work after login

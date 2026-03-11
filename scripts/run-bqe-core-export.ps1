@@ -13,6 +13,12 @@ param(
     [string]$Scope = $env:BQE_CORE_SCOPE,
     [int]$PageSize = 1000,
     [int]$RequestTimeout = 120,
+    [switch]$Incremental,
+    [string]$IncrementalStateFile = $env:BQE_CORE_INCREMENTAL_STATE_FILE,
+    [string]$IncrementalStart,
+    [int]$IncrementalOverlapSeconds = 300,
+    [string[]]$IncrementalField = @(),
+    [switch]$NoIncrementalDeletes,
     [switch]$DownloadDocumentFiles,
     [switch]$FailFast,
     [string[]]$AdditionalArguments = @()
@@ -121,6 +127,32 @@ if ($ApiBaseUrl) {
 
 if ($Scope) {
     $arguments += @('--scope', $Scope)
+}
+
+if ($Incremental) {
+    $arguments += '--incremental'
+}
+
+if ($IncrementalStateFile) {
+    $arguments += @('--incremental-state-file', $IncrementalStateFile)
+}
+
+if ($IncrementalStart) {
+    $arguments += @('--incremental-start', $IncrementalStart)
+}
+
+if ($IncrementalOverlapSeconds -ge 0) {
+    $arguments += @('--incremental-overlap-seconds', $IncrementalOverlapSeconds.ToString())
+}
+
+foreach ($fieldOverride in $IncrementalField) {
+    if ($fieldOverride) {
+        $arguments += @('--incremental-field', $fieldOverride)
+    }
+}
+
+if ($NoIncrementalDeletes) {
+    $arguments += '--no-incremental-deletes'
 }
 
 if ($DownloadDocumentFiles) {
