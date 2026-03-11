@@ -307,7 +307,127 @@ python scripts/export_bqe_core.py `
   --output-dir exports\customlist-delta
 ```
 
-## 8. How API calls work after login
+## 8. Curate exports for Power BI
+
+After a raw export completes, use the curation step to turn the JSON snapshot into stable Power BI-ready tables.
+
+The curation script in this repo is:
+
+- `scripts\curate_bqe_core_powerbi.py`
+
+The PowerShell wrapper is:
+
+- `scripts\run-bqe-core-curation.ps1`
+
+### Recommended output shape
+
+Use multiple curated files, not one giant combined file.
+
+Recommended pattern:
+
+- one folder per curated table
+- one `current.csv` per table by default
+- one stable root such as `exports\current`
+
+This matches the reporting plan and works better for Power BI because each table keeps its own grain and relationships.
+
+Examples:
+
+- `exports\current\stg_client\current.csv`
+- `exports\current\stg_project\current.csv`
+- `exports\current\stg_employee\current.csv`
+- `exports\current\stg_activity\current.csv`
+- `exports\current\stg_timeentry\current.csv`
+- `exports\current\stg_payment\current.csv`
+- `exports\current\stg_invoice\current.csv`
+- `exports\current\stg_bill\current.csv`
+- `exports\current\stg_check\current.csv`
+- `exports\current\stg_document\current.csv`
+- `exports\current\stg_crm_prospect\current.csv`
+- `exports\current\stg_crm_leadsource\current.csv`
+- `exports\current\stg_crm_region\current.csv`
+- `exports\current\stg_crm_score\current.csv`
+
+If you need a single upload artifact for transport or handoff, keep the curated output as multiple table files and use the optional zip file instead of flattening everything into one CSV.
+
+### Run the curation wrapper
+
+Use the latest export automatically:
+
+```powershell
+.\scripts\run-bqe-core-curation.ps1
+```
+
+Point at a specific raw export folder:
+
+```powershell
+.\scripts\run-bqe-core-curation.ps1 `
+  -SourceDir exports\bqe-core-20260311-132503 `
+  -OutputDir exports\current
+```
+
+Build a zip archive after the curated files are created:
+
+```powershell
+.\scripts\run-bqe-core-curation.ps1 `
+  -SourceDir exports\bqe-core-20260311-132503 `
+  -OutputDir exports\current `
+  -ZipOutput
+```
+
+Limit the run to a few tables:
+
+```powershell
+.\scripts\run-bqe-core-curation.ps1 `
+  -SourceDir exports\bqe-core-20260311-132503 `
+  -OutputDir exports\current `
+  -Tables stg_client,stg_project,stg_timeentry
+```
+
+Split very large tables into multiple CSV parts:
+
+```powershell
+.\scripts\run-bqe-core-curation.ps1 `
+  -SourceDir exports\bqe-core-20260311-132503 `
+  -OutputDir exports\current `
+  -RowsPerPart 250000
+```
+
+When `-RowsPerPart` is set, the script writes files such as `part-00001.csv`, `part-00002.csv`, and so on for only the tables that need splitting.
+
+### Run the Python curation script directly
+
+```powershell
+python scripts/curate_bqe_core_powerbi.py `
+  --source-dir exports\bqe-core-20260311-132503 `
+  --output-dir exports\current `
+  --zip-output
+```
+
+Useful options:
+
+- `--tables` to build only selected curated tables
+- `--rows-per-part` to split large outputs into multiple CSV files
+- `--max-rows-per-table` for a quick sample or smoke test
+- `--zip-output` to package the curated folder as a zip archive
+
+### What the curation step does
+
+- keeps only report-friendly columns from the raw export
+- normalizes IDs and blank zero GUID values
+- casts dates, booleans, whole numbers, and decimals into stable CSV values
+- preserves business keys needed for Power BI relationships
+- writes a `manifest.json` file under the curated output root
+- records endpoint failures from `export_summary.json` so the downstream process can see incomplete runs
+
+Recommended refresh order:
+
+1. run the raw export
+2. rebuild the curated output
+3. point Power BI to `exports\current`
+4. refresh the Power BI dataset
+
+## 9. How API calls work after login
 
 The docs say all API requests must include:
 
@@ -339,7 +459,7 @@ If your token response returned a different `endpoint`, use that value instead o
 
 For paged collection endpoints, the exporter sends the `page` query parameter as `<page number>,<page size>`. When you set `--page-batch-size` or `-PageBatchSize`, it sends several of those page requests concurrently and still writes the results in page order. By default it also adapts the live batch size based on observed page durations and backs off when the API starts returning `429` retries.
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 ### Redirect URI mismatch
 
@@ -426,7 +546,7 @@ Get-Content .env | Where-Object { $_ -match '^\s*[^#\s]' } | ForEach-Object { $n
 
 - If the browser still lands on the old account automatically, sign out of BQE first or use an InPrivate browser window before pasting the callback URL.
 
-## 10. Recommended first-run checklist
+## 11. Recommended first-run checklist
 
 - App type is `Regular Web App`
 - Redirect URI is registered and copied exactly
@@ -435,5 +555,6 @@ Get-Content .env | Where-Object { $_ -match '^\s*[^#\s]' } | ForEach-Object { $n
 - First interactive Python run completes successfully
 - Token cache is created
 - Wrapper script runs and writes files under `exports`
+- Curation script builds `exports\current` for Power BI
 
 Once those steps are complete, your Python exporter is set up to connect to BQE Core and export data.
