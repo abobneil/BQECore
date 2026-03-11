@@ -88,6 +88,14 @@ $env:BQE_CORE_TOKEN_CACHE = "$HOME\.bqe_core_export_tokens.json"
 $env:BQE_CORE_API_BASE_URL = "https://api.bqecore.com/api"
 ```
 
+You can also copy `.env.example` to `.env`, fill in your values, and load that file into your PowerShell session.
+
+If you saved those values in a local `.env` file, load them into your current PowerShell session with:
+
+```powershell
+Get-Content .env | Where-Object { $_ -match '^\s*[^#\s]' } | ForEach-Object { $name, $value = $_ -split '=', 2; $value = $value.Trim().Trim('"'); Set-Item -Path ("Env:" + $name.Trim()) -Value $value }
+```
+
 Notes:
 
 - The exporter normally learns the correct API base URL from the token response `endpoint` field.
@@ -107,6 +115,12 @@ python scripts/export_bqe_core.py `
   --scope $env:BQE_CORE_SCOPE `
   --endpoint company `
   --output-dir exports\bqe-core-auth-test
+```
+
+If you are loading credentials from `.env`, you can run the same first-time authorization as a single PowerShell command:
+
+```powershell
+Get-Content .env | Where-Object { $_ -match '^\s*[^#\s]' } | ForEach-Object { $name, $value = $_ -split '=', 2; $value = $value.Trim().Trim('"'); Set-Item -Path ("Env:" + $name.Trim()) -Value $value }; python scripts/export_bqe_core.py --client-id $env:BQE_CORE_CLIENT_ID --client-secret $env:BQE_CORE_CLIENT_SECRET --redirect-uri $env:BQE_CORE_REDIRECT_URI --scope $env:BQE_CORE_SCOPE --endpoint company --output-dir exports\bqe-core-auth-test
 ```
 
 What happens next:
@@ -151,6 +165,12 @@ After the token cache exists, you can use the wrapper script for repeatable expo
 
 ```powershell
 .\scripts\run-bqe-core-export.ps1
+```
+
+If you are using `.env`, you can load the values and run the wrapper in one command:
+
+```powershell
+Get-Content .env | Where-Object { $_ -match '^\s*[^#\s]' } | ForEach-Object { $name, $value = $_ -split '=', 2; $value = $value.Trim().Trim('"'); Set-Item -Path ("Env:" + $name.Trim()) -Value $value }; .\scripts\run-bqe-core-export.ps1
 ```
 
 This wrapper:
@@ -275,6 +295,35 @@ Fix:
 
 - Run the interactive Python command in Step 5 once to create the token cache.
 - Or provide `BQE_CORE_ACCESS_TOKEN` explicitly.
+
+### Need to sign in again with a different BQE account
+
+Symptoms:
+
+- The exporter keeps reusing the old cached login.
+- You changed the BQE account used for API access and want a fresh sign-in.
+
+Fix:
+
+- Remove the cached token file:
+
+```powershell
+Remove-Item "$HOME\.bqe_core_export_tokens.json" -Force -ErrorAction SilentlyContinue
+```
+
+- Remove any manually set access token override:
+
+```powershell
+Remove-Item Env:BQE_CORE_ACCESS_TOKEN -ErrorAction SilentlyContinue
+```
+
+- Then run the interactive authorization command again:
+
+```powershell
+Get-Content .env | Where-Object { $_ -match '^\s*[^#\s]' } | ForEach-Object { $name, $value = $_ -split '=', 2; $value = $value.Trim().Trim('"'); Set-Item -Path ("Env:" + $name.Trim()) -Value $value }; python scripts/export_bqe_core.py --client-id $env:BQE_CORE_CLIENT_ID --client-secret $env:BQE_CORE_CLIENT_SECRET --redirect-uri $env:BQE_CORE_REDIRECT_URI --scope $env:BQE_CORE_SCOPE --endpoint company --output-dir exports\bqe-core-auth-test
+```
+
+- If the browser still lands on the old account automatically, sign out of BQE first or use an InPrivate browser window before pasting the callback URL.
 
 ## 10. Recommended first-run checklist
 
