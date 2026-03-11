@@ -427,6 +427,176 @@ Recommended refresh order:
 3. point Power BI to `exports\current`
 4. refresh the Power BI dataset
 
+### Build the Power BI semantic model from SharePoint
+
+After the curated folders are uploaded to SharePoint, use the `SharePoint Folder` connector and build one query per curated table folder.
+
+Recommended SharePoint structure:
+
+- `Shared Documents/stg_client/current.csv`
+- `Shared Documents/stg_project/current.csv`
+- `Shared Documents/stg_employee/current.csv`
+- `Shared Documents/stg_activity/current.csv`
+- `Shared Documents/stg_timeentry/current.csv`
+- `Shared Documents/stg_payment/current.csv`
+- `Shared Documents/stg_invoice/current.csv`
+- `Shared Documents/stg_bill/current.csv`
+- `Shared Documents/stg_check/current.csv`
+- `Shared Documents/stg_crm_prospect/current.csv`
+- `Shared Documents/stg_crm_leadsource/current.csv`
+- `Shared Documents/stg_crm_region/current.csv`
+- `Shared Documents/stg_crm_score/current.csv`
+
+#### In Power BI
+
+1. Select `Get data` -> `SharePoint Folder`.
+2. Enter the site URL only, for example `https://yourtenant.sharepoint.com/sites/BQECoreDataDump`.
+3. Open the query editor instead of combining everything into one table.
+4. Rename the first file-list query to `SharePointFiles`.
+5. For each curated folder, create a `Reference` query from `SharePointFiles`.
+6. Filter `Folder Path` to one folder such as `.../Shared Documents/stg_client/`.
+7. Click the `Binary` value in `Content` for that filtered query to load the CSV for that table.
+8. Repeat for each table you want in the semantic model.
+
+Do not combine all `current.csv` files into one table. Each folder represents a different table grain.
+
+#### Recommended Power BI query names
+
+- `stg_client` -> `DimClient`
+- `stg_project` -> `DimProject`
+- `stg_employee` -> `DimEmployee`
+- `stg_activity` -> `DimActivity`
+- `stg_timeentry` -> `FactTimeEntry`
+- `stg_payment` -> `FactPayment`
+- `stg_invoice` -> `FactInvoice`
+- `stg_bill` -> `FactBill`
+- `stg_check` -> `FactCheck`
+- `stg_crm_prospect` -> `FactProspect`
+- `stg_crm_leadsource` -> `DimLeadSource`
+- `stg_crm_region` -> `DimRegion`
+- `stg_crm_score` -> `DimScore`
+
+Optional for later:
+
+- `stg_document` -> only load if you want document reporting
+
+Keep `SharePointFiles` only as a helper query. Do not use it as a reporting table.
+
+#### Data types
+
+Set data types consistently after each query loads:
+
+- IDs such as `ClientId`, `ProjectId`, `EmployeeId`, `ResourceId`, `ActivityId`, and `InvoiceId` -> `Text`
+- dates such as `Date`, `Due Date`, `Accounting Date`, and `Assigned Date` -> `Date`
+- measures of value such as hours, amounts, rates, balances, taxes, and percentages -> `Decimal Number`
+- flags such as `Billable`, `Is Draft`, `Is Void`, `Is EFT`, and `Is Bill Payment` -> `True/False`
+- code fields such as status and type columns -> `Whole Number` unless you later map them to labels
+
+If you are modeling in the Power BI Service experience and there is no explicit `Close & Apply` button, use `Create a semantic model` if offered, or `Create a report`. That step applies the queries and builds the dataset.
+
+### Relationship design in Power BI
+
+Create these active relationships first:
+
+- `DimClient[ClientId]` -> `DimProject[ClientId]`
+- `DimProject[ProjectId]` -> `FactTimeEntry[ProjectId]`
+- `DimEmployee[EmployeeId]` -> `FactTimeEntry[ResourceId]`
+- `DimActivity[ActivityId]` -> `FactTimeEntry[ActivityId]`
+- `DimClient[ClientId]` -> `FactPayment[ClientId]`
+
+Create this relationship as inactive to avoid ambiguous filter paths:
+
+- `DimProject[ProjectId]` -> `FactPayment[ProjectId]`
+
+Power BI can reject an active `DimProject` to `FactPayment` relationship because it creates two paths from `DimClient` to `FactPayment`:
+
+- direct: `DimClient` -> `FactPayment`
+- indirect: `DimClient` -> `DimProject` -> `FactPayment`
+
+For invoice data, keep `FactInvoice` standalone in the first version. Do not force a relationship from `FactInvoice` to `DimClient` or `DimProject` unless you define a trusted business rule.
+
+When creating relationships, use:
+
+- cardinality: `One to many`
+- cross-filter direction: `Single`
+- active: `Yes` unless noted otherwise
+
+### First measures
+
+Create measures in the fact table they summarize, or in a dedicated measures table if you create one later.
+
+Put these under `FactTimeEntry`:
+
+```DAX
+Total Hours = SUM(FactTimeEntry[Actual Hours])
+```
+
+```DAX
+Billable Hours = CALCULATE([Total Hours], FactTimeEntry[Billable] = TRUE())
+```
+
+```DAX
+Non-Billable Hours = CALCULATE([Total Hours], FactTimeEntry[Billable] = FALSE())
+```
+
+Put these under `FactInvoice`:
+
+```DAX
+Total Invoice Amount = SUM(FactInvoice[Invoice Amount])
+```
+
+```DAX
+Open AR = SUM(FactInvoice[Balance])
+```
+
+Put these under `FactPayment`:
+
+```DAX
+Total Payments Received = SUM(FactPayment[Amount])
+```
+
+Put these under `FactBill`:
+
+```DAX
+Total Bill Amount = SUM(FactBill[Amount])
+```
+
+Put these under `FactCheck`:
+
+```DAX
+Total Check Amount = SUM(FactCheck[Amount])
+```
+
+Use measure names that do not collide with raw column names. For example, prefer `Total Invoice Amount` instead of `Invoice Amount` if the table already has a column named `Invoice Amount`.
+
+### First validation report
+
+Before building a polished report, create one simple page to validate the model:
+
+- card: `Total Hours`
+- card: `Billable Hours`
+- card: `Non-Billable Hours`
+- line chart: `FactTimeEntry[Date]` by `Total Hours`
+- bar chart: `DimEmployee[Display Name]` by `Total Hours`
+- bar chart: `DimProject[Project Name]` by `Total Hours`
+- bar chart: `DimActivity[Activity Name]` by `Total Hours`
+- slicers: `DimClient[Client Name]`, `DimProject[Project Name]`, `DimEmployee[Display Name]`, and `FactTimeEntry[Date]`
+
+If client, project, employee, and activity filters all change the hour visuals as expected, the model is working well enough to continue.
+
+### Repeatable monthly or daily process
+
+Use the same sequence each time:
+
+1. run the raw BQE export
+2. run the curation script to rebuild the stable curated outputs
+3. replace the SharePoint folder contents with the new curated files
+4. keep the same folder names and file names so Power BI sources do not break
+5. refresh the Power BI semantic model
+6. review key measures such as `Total Hours`, `Total Invoice Amount`, `Total Payments Received`, and `Open AR` for sanity
+
+If modeling in Power BI Service becomes limiting, switch the modeling work to Power BI Desktop, then publish the semantic model back to the service. The same SharePoint folder source pattern still applies.
+
 ## 9. How API calls work after login
 
 The docs say all API requests must include:
