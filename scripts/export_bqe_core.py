@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import secrets
 import sys
@@ -29,6 +30,7 @@ DEFAULT_INCREMENTAL_STATE_FILE = Path("exports") / "bqe-core-incremental-state.j
 DEFAULT_INCREMENTAL_OVERLAP_SECONDS = 300
 DEFAULT_INCREMENTAL_FIELD = "lastUpdated"
 DELETED_HISTORY_ENDPOINT = "deletedhistory"
+LOGGER_NAME = "bqe_core_exporter"
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 DEFAULT_ENDPOINTS = [
     "activity",
@@ -221,11 +223,13 @@ class BQEHttpClient:
         user_agent: str,
         get_authorization_header: callable,
         refresh_tokens: callable | None = None,
+        logger: logging.Logger | None = None,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self.user_agent = user_agent
         self.get_authorization_header = get_authorization_header
         self.refresh_tokens = refresh_tokens
+        self.logger = logger
 
     def get_json(self, url: str, query: dict[str, str] | None = None) -> HttpResponse:
         return self._request("GET", url, query=query)
@@ -292,6 +296,12 @@ class BQEHttpClient:
                     body=error.read(),
                 )
                 if response.status_code == 401 and include_auth and allow_refresh and self.refresh_tokens is not None:
+                    if self.logger is not None:
+                        self.logger.warning(
+                            "Received 401 for %s %s; attempting token refresh.",
+                            method,
+                            request_url,
+                        )
                     refreshed = self.refresh_tokens()
                     if refreshed:
                         return self._request(
@@ -304,6 +314,14 @@ class BQEHttpClient:
                             allow_refresh=False,
                         )
                 if response.status_code in RETRYABLE_STATUS_CODES and attempt < 3:
+                    if self.logger is not None:
+                        self.logger.warning(
+                            "Retrying after HTTP %s for %s %s (attempt %s/4).",
+                            response.status_code,
+                            method,
+                            request_url,
+                            attempt + 2,
+                        )
                     self._sleep_before_retry(response.headers, attempt)
                     continue
                 if response.status_code == 204:
@@ -311,6 +329,14 @@ class BQEHttpClient:
                 raise ExportError(_format_http_error(method, request_url, response)) from error
             except urllib.error.URLError as error:
                 if attempt < 3:
+                    if self.logger is not None:
+                        self.logger.warning(
+                            "Retrying after network error for %s %s (attempt %s/4): %s",
+                            method,
+                            request_url,
+                            attempt + 2,
+                            error,
+                        )
                     time.sleep(2 ** attempt)
                     continue
                 raise ExportError(f"Request failed for {method} {request_url}: {error}") from error
@@ -332,6 +358,7 @@ class BQECoreExporter:
         self.args = args
         self.output_dir = Path(args.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.logger = logging.getLogger(LOGGER_NAME)
         self.token_store = TokenStore(Path(args.token_cache))
         self.incremental_state_store = IncrementalStateStore(Path(args.incremental_state_file))
         self.tokens: OAuthTokens | None = None
@@ -344,8 +371,17 @@ class BQECoreExporter:
             user_agent=DEFAULT_USER_AGENT,
             get_authorization_header=self._get_authorization_header,
             refresh_tokens=self._refresh_tokens_if_possible,
+            logger=self.logger,
+        )
+        self.logger.info(
+            "Exporter initialized. outputDir=%s tokenCache=%s incremental=%s logFile=%s",
+            self.output_dir.resolve(),
+            self.token_store.path,
+            self.args.incremental,
+            getattr(self.args, "log_file", ""),
         )
         self.tokens = self._load_tokens()
+        self.logger.info("Using API base URL: %s", self._api_base_url())
 
     def export_all(self, endpoints: list[str]) -> dict[str, Any]:
         summary: dict[str, Any] = {
@@ -353,6 +389,7 @@ class BQECoreExporter:
             "outputDir": str(self.output_dir.resolve()),
             "pageSize": self.args.page_size,
             "downloadDocumentFiles": self.args.download_document_files,
+            "logFile": str(Path(self.args.log_file).resolve()),
             "endpoints": [],
         }
         if self.args.incremental:
@@ -363,21 +400,56 @@ class BQECoreExporter:
                 "autoDeletedHistory": not self.args.no_incremental_deletes,
             }
 
+        self.logger.info(
+            "Export run started. endpoints=%s outputDir=%s pageSize=%s incremental=%s",
+            len(endpoints),
+            self.output_dir.resolve(),
+            self.args.page_size,
+            self.args.incremental,
+        )
+
         for endpoint in endpoints:
+            endpoint_started_at = _utc_now()
+            endpoint_started_perf = time.perf_counter()
+            self.logger.info("Endpoint started: %s", endpoint)
             try:
                 endpoint_summary = self._export_endpoint(endpoint)
             except Exception as error:
+                duration_seconds = _elapsed_seconds(endpoint_started_perf)
                 endpoint_summary = {
                     "endpoint": endpoint,
                     "status": "failed",
                     "error": str(error),
+                    "startedAt": endpoint_started_at,
+                    "finishedAt": _utc_now(),
+                    "durationSeconds": duration_seconds,
                 }
+                self.logger.exception(
+                    "Endpoint failed: %s durationSeconds=%.3f",
+                    endpoint,
+                    duration_seconds,
+                )
                 if self.args.fail_fast:
                     summary["endpoints"].append(endpoint_summary)
                     summary["finishedAt"] = _utc_now()
+                    self._update_summary_counts(summary)
                     self._write_summary(summary)
                     raise
+            else:
+                endpoint_summary.setdefault("startedAt", endpoint_started_at)
+                endpoint_summary.setdefault("finishedAt", _utc_now())
+                endpoint_summary.setdefault("durationSeconds", _elapsed_seconds(endpoint_started_perf))
+                self.logger.info(
+                    "Endpoint completed: %s records=%s pages=%s file=%s durationSeconds=%.3f",
+                    endpoint,
+                    endpoint_summary.get("records", 0),
+                    endpoint_summary.get("pages", 0),
+                    endpoint_summary.get("file"),
+                    endpoint_summary.get("durationSeconds", 0.0),
+                )
             summary["endpoints"].append(endpoint_summary)
+            self._update_summary_counts(summary)
+            self._write_summary(summary)
 
         if self.document_downloads:
             downloads_path = self.output_dir / "document_downloads.json"
@@ -386,11 +458,22 @@ class BQECoreExporter:
                 "file": downloads_path.name,
                 "count": len(self.document_downloads),
             }
+            self.logger.info(
+                "Document download summary written: %s count=%s",
+                downloads_path,
+                len(self.document_downloads),
+            )
 
         summary["finishedAt"] = _utc_now()
-        summary["successCount"] = sum(1 for item in summary["endpoints"] if item.get("status") == "completed")
-        summary["failureCount"] = sum(1 for item in summary["endpoints"] if item.get("status") == "failed")
+        self._update_summary_counts(summary)
         self._write_summary(summary)
+        self.logger.info(
+            "Export run finished. status=%s successfulEndpoints=%s failedEndpoints=%s summary=%s",
+            summary["status"],
+            summary["successCount"],
+            summary["failureCount"],
+            self.output_dir / "export_summary.json",
+        )
         return summary
 
     def _export_endpoint(self, endpoint: str) -> dict[str, Any]:
@@ -402,19 +485,43 @@ class BQECoreExporter:
         pages_fetched = 0
         export_options = self._build_endpoint_export_options(endpoint)
         max_watermark_value: str | None = None
+        self.logger.info("Preparing endpoint export: endpoint=%s destination=%s", endpoint, destination)
+        if export_options.incremental_summary:
+            self.logger.info(
+                "Incremental settings: endpoint=%s field=%s previousWatermark=%s queryWatermark=%s",
+                endpoint,
+                export_options.incremental_summary.get("field"),
+                export_options.incremental_summary.get("previousWatermark"),
+                export_options.incremental_summary.get("queryWatermark"),
+            )
         try:
             while True:
                 query = self._build_query(page_number, export_options)
+                self.logger.info(
+                    "Requesting endpoint page: endpoint=%s page=%s query=%s",
+                    endpoint,
+                    page_number,
+                    json.dumps(query, sort_keys=True),
+                )
                 response = self.client.get_json(_join_url(self._api_base_url(), endpoint), query=query)
                 if response.status_code == 204:
+                    self.logger.info("Endpoint returned no content: endpoint=%s page=%s", endpoint, page_number)
                     break
                 payload = response.json()
                 records, is_collection = _extract_records(payload)
                 if not records:
+                    self.logger.info("Endpoint returned no records: endpoint=%s page=%s", endpoint, page_number)
                     break
                 writer.write_records(records)
                 total_records += len(records)
                 pages_fetched += 1
+                self.logger.info(
+                    "Page exported: endpoint=%s page=%s records=%s totalRecords=%s",
+                    endpoint,
+                    page_number,
+                    len(records),
+                    total_records,
+                )
                 max_watermark_value = self._max_endpoint_watermark(
                     max_watermark_value,
                     records,
@@ -423,6 +530,14 @@ class BQECoreExporter:
                 if self.args.download_document_files and endpoint == "document":
                     self._download_documents(records)
                 if not is_collection or len(records) < self.args.page_size:
+                    self.logger.info(
+                        "Endpoint pagination complete: endpoint=%s page=%s isCollection=%s pageSize=%s recordsOnPage=%s",
+                        endpoint,
+                        page_number,
+                        is_collection,
+                        self.args.page_size,
+                        len(records),
+                    )
                     break
                 page_number += 1
         finally:
@@ -578,6 +693,8 @@ class BQECoreExporter:
 
     def _download_documents(self, records: list[Any]) -> None:
         document_dir = self.output_dir / "document_files"
+        if records:
+            self.logger.info("Downloading document files for %s records.", len(records))
         for record in records:
             if not isinstance(record, dict):
                 continue
@@ -590,6 +707,7 @@ class BQECoreExporter:
                     self.document_downloads.append(
                         {"id": document_id, "status": "skipped", "reason": "empty uri"}
                     )
+                    self.logger.warning("Document download skipped: id=%s reason=empty uri", document_id)
                     continue
                 target_name = _document_file_name(document_id, uri)
                 target_path = document_dir / target_name
@@ -597,13 +715,20 @@ class BQECoreExporter:
                 self.document_downloads.append(
                     {"id": document_id, "status": "downloaded", "file": str(target_path.relative_to(self.output_dir))}
                 )
+                self.logger.info(
+                    "Document downloaded: id=%s file=%s",
+                    document_id,
+                    target_path.relative_to(self.output_dir),
+                )
             except Exception as error:
                 self.document_downloads.append(
                     {"id": document_id, "status": "failed", "error": str(error)}
                 )
+                self.logger.exception("Document download failed: id=%s", document_id)
 
     def _load_tokens(self) -> OAuthTokens | None:
         if self.args.access_token:
+            self.logger.info("Using access token supplied via argument or environment.")
             return OAuthTokens(
                 access_token=self.args.access_token,
                 endpoint=_normalize_base_url(self.args.api_base_url),
@@ -611,12 +736,15 @@ class BQECoreExporter:
 
         cached_tokens = self.token_store.load()
         if cached_tokens is not None and not cached_tokens.is_expired():
+            self.logger.info("Using cached OAuth tokens from %s", self.token_store.path)
             return cached_tokens
         if cached_tokens is not None and cached_tokens.refresh_token and self.args.client_id and self.args.client_secret:
+            self.logger.info("Cached OAuth token expired; attempting refresh using %s", self.token_store.path)
             self.tokens = cached_tokens
             refreshed = self._refresh_tokens_if_possible()
             if refreshed:
                 return self.tokens
+        self.logger.info("Cached tokens unavailable or unusable; starting interactive authorization.")
         return self._authorize_interactively()
 
     def _authorize_interactively(self) -> OAuthTokens:
@@ -648,8 +776,8 @@ class BQECoreExporter:
             },
         )
 
-        print("Open this URL to authorize the export:", file=sys.stderr)
-        print(authorize_url, file=sys.stderr)
+        self.logger.info("Open this URL to authorize the export:")
+        self.logger.info(authorize_url)
         if not self.args.no_browser:
             webbrowser.open(authorize_url)
 
@@ -675,6 +803,7 @@ class BQECoreExporter:
         if not tokens.endpoint:
             tokens.endpoint = _normalize_base_url(self.args.api_base_url)
         self.token_store.save(tokens)
+        self.logger.info("OAuth authorization succeeded. Token cache updated: %s", self.token_store.path)
         return tokens
 
     def _refresh_tokens_if_possible(self) -> bool:
@@ -684,6 +813,7 @@ class BQECoreExporter:
             return False
         if not self.args.client_id or not self.args.client_secret:
             return False
+        self.logger.info("Refreshing OAuth access token.")
         response = self.client.post_form(
             f"{IDENTITY_BASE_URL}/connect/token",
             {
@@ -699,12 +829,14 @@ class BQECoreExporter:
             refreshed_tokens.endpoint = self.tokens.endpoint or _normalize_base_url(self.args.api_base_url)
         self.tokens = refreshed_tokens
         self.token_store.save(refreshed_tokens)
+        self.logger.info("OAuth token refresh succeeded. Token cache updated: %s", self.token_store.path)
         return True
 
     def _get_authorization_header(self) -> str | None:
         if self.tokens is None:
             return None
         if self.tokens.is_expired() and self.tokens.refresh_token:
+            self.logger.info("Cached access token is expired; refreshing before request.")
             self._refresh_tokens_if_possible()
         return self.tokens.authorization_header()
 
@@ -716,6 +848,11 @@ class BQECoreExporter:
     def _write_summary(self, summary: dict[str, Any]) -> None:
         summary_path = self.output_dir / "export_summary.json"
         summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    def _update_summary_counts(self, summary: dict[str, Any]) -> None:
+        summary["successCount"] = sum(1 for item in summary["endpoints"] if item.get("status") == "completed")
+        summary["failureCount"] = sum(1 for item in summary["endpoints"] if item.get("status") == "failed")
+        summary["status"] = "completed_with_failures" if summary["failureCount"] else "completed"
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -757,6 +894,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--download-document-files", action="store_true")
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
+    parser.add_argument("--log-file", default=os.getenv("BQE_CORE_LOG_FILE"))
     parser.add_argument(
         "--output-dir",
         default=str(Path("exports") / f"bqe-core-{datetime.now().strftime('%Y%m%d-%H%M%S')}"),
@@ -906,6 +1044,37 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _elapsed_seconds(started_at: float) -> float:
+    return round(max(time.perf_counter() - started_at, 0.0), 3)
+
+
+def _configure_logging(args: argparse.Namespace) -> logging.Logger:
+    log_path = Path(args.log_file) if args.log_file else Path(args.output_dir) / "export.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    args.log_file = str(log_path)
+
+    logger = logging.getLogger(LOGGER_NAME)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+
+    formatter = logging.Formatter("%(asctime)sZ %(levelname)s %(message)s", "%Y-%m-%dT%H:%M:%S")
+    formatter.converter = time.gmtime
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    return logger
+
+
 def _format_bqe_datetime(value: datetime) -> str:
     utc_value = value.astimezone(timezone.utc).replace(microsecond=0, tzinfo=None)
     return utc_value.isoformat(timespec="seconds")
@@ -964,6 +1133,7 @@ def _combine_where_clause(existing_clause: str | None, extra_clause: str) -> str
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
+    logger = _configure_logging(args)
 
     if args.expand and args.page_size > 100:
         args.page_size = 100
@@ -982,15 +1152,19 @@ def main() -> int:
     exporter = BQECoreExporter(args)
     summary = exporter.export_all(endpoints)
 
-    print(f"Export complete: {summary['outputDir']}")
-    print(f"Successful endpoints: {summary['successCount']}")
-    print(f"Failed endpoints: {summary['failureCount']}")
-    return 0 if summary["failureCount"] == 0 else 1
+    logger.info("Export complete: %s", summary["outputDir"])
+    logger.info("Successful endpoints: %s", summary["successCount"])
+    logger.info("Failed endpoints: %s", summary["failureCount"])
+    return 0
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except ExportError as error:
-        print(f"Error: {error}", file=sys.stderr)
+        logger = logging.getLogger(LOGGER_NAME)
+        if logger.handlers:
+            logger.error("Error: %s", error)
+        else:
+            print(f"Error: {error}", file=sys.stderr)
         raise SystemExit(1)

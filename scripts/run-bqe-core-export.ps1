@@ -94,10 +94,24 @@ $logPath = Join-Path $logDir ("bqe-core-" + $timestamp + '.log')
 
 New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+New-Item -ItemType File -Force -Path $logPath | Out-Null
+
+function Write-LogMessage {
+    param(
+        [string]$Message,
+        [string]$Level = 'INFO'
+    )
+
+    $timestamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $line = "$timestamp [$Level] $Message"
+    Write-Host $line
+    Add-Content -Path $logPath -Value $line
+}
 
 $arguments = @(
     $ExporterPath,
     '--output-dir', $outputDir,
+    '--log-file', $logPath,
     '--endpoints-file', $EndpointFile,
     '--page-size', $PageSize.ToString(),
     '--request-timeout', $RequestTimeout.ToString(),
@@ -167,14 +181,14 @@ if ($AdditionalArguments.Count -gt 0) {
     $arguments += $AdditionalArguments
 }
 
-Write-Host "Export starting..."
-Write-Host "Repo root: $RepoRoot"
-Write-Host "Output directory: $outputDir"
-Write-Host "Log file: $logPath"
+Write-LogMessage "Export starting..."
+Write-LogMessage "Repo root: $RepoRoot"
+Write-LogMessage "Output directory: $outputDir"
+Write-LogMessage "Log file: $logPath"
 
 Push-Location $RepoRoot
 try {
-    & $PythonPath @arguments 2>&1 | Tee-Object -FilePath $logPath
+    & $PythonPath @arguments
     $exitCode = $LASTEXITCODE
 }
 finally {
@@ -186,10 +200,11 @@ if ($null -eq $exitCode) {
 }
 
 if ($exitCode -ne 0) {
+    Write-LogMessage "BQE Core export failed. See $logPath" 'ERROR'
     Write-Error "BQE Core export failed. See $logPath"
 }
 
-Write-Host "BQE Core export completed."
-Write-Host "Output directory: $outputDir"
-Write-Host "Log file: $logPath"
+Write-LogMessage "BQE Core export completed."
+Write-LogMessage "Output directory: $outputDir"
+Write-LogMessage "Log file: $logPath"
 exit $exitCode
