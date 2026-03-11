@@ -90,6 +90,18 @@ $env:BQE_CORE_API_BASE_URL = "https://api.bqecore.com/api"
 
 You can also copy `.env.example` to `.env`, fill in your values, and load that file into your PowerShell session.
 
+For convenience, you can use the helper script:
+
+```powershell
+.\scripts\load-env.ps1
+```
+
+The export wrapper now auto-loads `.env` from the repo root if that file exists, so in the common case you can just run:
+
+```powershell
+.\scripts\run-bqe-core-export.ps1
+```
+
 If you saved those values in a local `.env` file, load them into your current PowerShell session with:
 
 ```powershell
@@ -190,6 +202,22 @@ Useful examples:
 .\scripts\run-bqe-core-export.ps1 -FailFast
 ```
 
+```powershell
+.\scripts\run-bqe-core-export.ps1 -PageBatchSize 5
+```
+
+`-PageBatchSize` controls how many pages the exporter requests concurrently for each endpoint. The API still returns one page per HTTP request, but the exporter can now fetch multiple pages in parallel to speed up large exports.
+
+Adaptive throttling is enabled by default when `-PageBatchSize` is greater than `1`. The exporter starts conservatively, watches page response times, and automatically reduces concurrency if it encounters `429` retries.
+
+```powershell
+.\scripts\run-bqe-core-export.ps1 -PageBatchSize 5 -TargetRequestsPerMinute 60
+```
+
+```powershell
+.\scripts\run-bqe-core-export.ps1 -PageBatchSize 5 -NoAdaptivePageBatching
+```
+
 ### Incremental exports after the first run
 
 The exporter now supports checkpoint-based incremental exports.
@@ -226,6 +254,21 @@ Useful incremental examples:
 ```powershell
 python scripts/export_bqe_core.py `
   --endpoints-file scripts/bqe-core-endpoints.txt `
+  --output-dir exports\manual-run
+```
+
+```powershell
+python scripts/export_bqe_core.py `
+  --endpoints-file scripts/bqe-core-endpoints.txt `
+  --page-batch-size 5 `
+  --output-dir exports\manual-run
+```
+
+```powershell
+python scripts/export_bqe_core.py `
+  --endpoints-file scripts/bqe-core-endpoints.txt `
+  --page-batch-size 5 `
+  --target-requests-per-minute 60 `
   --output-dir exports\manual-run
 ```
 
@@ -293,6 +336,8 @@ print(response.json())
 ```
 
 If your token response returned a different `endpoint`, use that value instead of the default base URL.
+
+For paged collection endpoints, the exporter sends the `page` query parameter as `<page number>,<page size>`. When you set `--page-batch-size` or `-PageBatchSize`, it sends several of those page requests concurrently and still writes the results in page order. By default it also adapts the live batch size based on observed page durations and backs off when the API starts returning `429` retries.
 
 ## 9. Troubleshooting
 

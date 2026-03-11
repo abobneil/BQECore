@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import os
 import secrets
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -23,6 +25,8 @@ IDENTITY_BASE_URL = "https://api-identity.bqecore.com/idp"
 DEFAULT_API_BASE_URL = "https://api.bqecore.com/api"
 DEFAULT_SCOPE = "read:core offline_access"
 DEFAULT_PAGE_SIZE = 1000
+DEFAULT_PAGE_BATCH_SIZE = 1
+DEFAULT_ADAPTIVE_TARGET_REQUESTS_PER_MINUTE = 60
 DEFAULT_TIMEOUT_SECONDS = 120
 DEFAULT_USER_AGENT = "bqe-core-exporter/1.0"
 DEFAULT_TOKEN_CACHE = Path.home() / ".bqe_core_export_tokens.json"
@@ -125,6 +129,13 @@ class HttpResponse:
     status_code: int
     headers: dict[str, str]
     body: bytes
+    elapsed_seconds: float = 0.0
+    attempt_count: int = 1
+    retry_status_codes: list[int] = field(default_factory=list)
+    retry_after_seconds: int | None = None
+    rate_limit_limit: str | None = None
+    rate_limit_remaining: int | None = None
+    rate_limit_reset: str | None = None
 
     def json(self) -> Any:
         if not self.body:
@@ -188,6 +199,108 @@ class EndpointExportOptions:
     order_by: str | None
     expand: str | None
     incremental_summary: dict[str, Any] | None = None
+
+
+@dataclass
+class PageFetchResult:
+    page_number: int
+    records: list[Any]
+    is_collection: bool
+    status_code: int
+    elapsed_seconds: float = 0.0
+    attempt_count: int = 1
+    retry_status_codes: list[int] = field(default_factory=list)
+    retry_after_seconds: int | None = None
+    rate_limit_limit: str | None = None
+    rate_limit_remaining: int | None = None
+    rate_limit_reset: str | None = None
+
+
+@dataclass
+class AdaptivePageBatchController:
+    max_batch_size: int
+    enabled: bool
+    target_requests_per_minute: int = DEFAULT_ADAPTIVE_TARGET_REQUESTS_PER_MINUTE
+    current_batch_size: int = 1
+    average_page_seconds: float | None = None
+    cooldown_batches: int = 0
+    reduced_due_to_rate_limit: bool = False
+    last_rate_limit_limit: str | None = None
+    last_rate_limit_remaining: int | None = None
+    last_rate_limit_reset: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.enabled or self.max_batch_size <= 1:
+            self.current_batch_size = max(1, self.max_batch_size)
+        else:
+            self.current_batch_size = 1
+
+    def next_batch_size(self) -> int:
+        return max(1, min(self.current_batch_size, self.max_batch_size))
+
+    def observe_batch(self, page_results: list[PageFetchResult]) -> int:
+        if not page_results:
+            return self.next_batch_size()
+
+        for page_result in page_results:
+            if page_result.rate_limit_limit:
+                self.last_rate_limit_limit = page_result.rate_limit_limit
+            if page_result.rate_limit_remaining is not None:
+                self.last_rate_limit_remaining = page_result.rate_limit_remaining
+            if page_result.rate_limit_reset:
+                self.last_rate_limit_reset = page_result.rate_limit_reset
+
+        elapsed_values = [page_result.elapsed_seconds for page_result in page_results if page_result.elapsed_seconds > 0]
+        if elapsed_values:
+            batch_average = sum(elapsed_values) / len(elapsed_values)
+            if self.average_page_seconds is None:
+                self.average_page_seconds = batch_average
+            else:
+                self.average_page_seconds = (self.average_page_seconds * 0.7) + (batch_average * 0.3)
+
+        if not self.enabled or self.max_batch_size <= 1:
+            return self.next_batch_size()
+
+        had_rate_limit = any(429 in page_result.retry_status_codes for page_result in page_results)
+        if had_rate_limit:
+            self.reduced_due_to_rate_limit = True
+            self.cooldown_batches = 3
+            if self.current_batch_size <= 2:
+                self.current_batch_size = 1
+            else:
+                self.current_batch_size = max(1, self.current_batch_size // 2)
+            return self.next_batch_size()
+
+        desired_batch_size = self._desired_batch_size()
+        if self.cooldown_batches > 0:
+            self.cooldown_batches -= 1
+            desired_batch_size = min(desired_batch_size, self.current_batch_size)
+
+        if desired_batch_size > self.current_batch_size:
+            self.current_batch_size += 1
+        else:
+            self.current_batch_size = desired_batch_size
+        return self.next_batch_size()
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled and self.max_batch_size > 1,
+            "maxBatchSize": self.max_batch_size,
+            "finalBatchSize": self.next_batch_size(),
+            "targetRequestsPerMinute": self.target_requests_per_minute,
+            "averagePageSeconds": round(self.average_page_seconds, 3) if self.average_page_seconds is not None else None,
+            "rateLimitBackoffApplied": self.reduced_due_to_rate_limit,
+            "lastRateLimitLimit": self.last_rate_limit_limit,
+            "lastRateLimitRemaining": self.last_rate_limit_remaining,
+            "lastRateLimitReset": self.last_rate_limit_reset,
+        }
+
+    def _desired_batch_size(self) -> int:
+        if self.average_page_seconds is None:
+            return self.next_batch_size()
+        requests_per_second = max(self.target_requests_per_minute, 1) / 60
+        desired = int(requests_per_second * max(self.average_page_seconds, 1.0))
+        return max(1, min(desired, self.max_batch_size))
 
 
 class JsonArrayWriter:
@@ -268,6 +381,9 @@ class BQEHttpClient:
         allow_refresh: bool = True,
     ) -> HttpResponse:
         request_url = _build_url(url, query)
+        request_started_at = time.perf_counter()
+        retry_status_codes: list[int] = []
+        retry_after_seconds: int | None = None
         headers = {
             "User-Agent": self.user_agent,
             "Accept": "application/json, text/plain;q=0.9, */*;q=0.8",
@@ -288,12 +404,26 @@ class BQEHttpClient:
                         status_code=response.getcode(),
                         headers=dict(response.headers.items()),
                         body=response.read(),
+                        elapsed_seconds=_elapsed_seconds(request_started_at),
+                        attempt_count=attempt + 1,
+                        retry_status_codes=list(retry_status_codes),
+                        retry_after_seconds=retry_after_seconds,
+                        rate_limit_limit=dict(response.headers.items()).get("X-Rate-Limit-Limit"),
+                        rate_limit_remaining=_maybe_int(dict(response.headers.items()).get("X-Rate-Limit-Remaining")),
+                        rate_limit_reset=dict(response.headers.items()).get("X-Rate-Limit-Reset"),
                     )
             except urllib.error.HTTPError as error:
                 response = HttpResponse(
                     status_code=error.code,
                     headers=dict(error.headers.items()),
                     body=error.read(),
+                    elapsed_seconds=_elapsed_seconds(request_started_at),
+                    attempt_count=attempt + 1,
+                    retry_status_codes=list(retry_status_codes),
+                    retry_after_seconds=retry_after_seconds,
+                    rate_limit_limit=dict(error.headers.items()).get("X-Rate-Limit-Limit"),
+                    rate_limit_remaining=_maybe_int(dict(error.headers.items()).get("X-Rate-Limit-Remaining")),
+                    rate_limit_reset=dict(error.headers.items()).get("X-Rate-Limit-Reset"),
                 )
                 if response.status_code == 401 and include_auth and allow_refresh and self.refresh_tokens is not None:
                     if self.logger is not None:
@@ -314,6 +444,8 @@ class BQEHttpClient:
                             allow_refresh=False,
                         )
                 if response.status_code in RETRYABLE_STATUS_CODES and attempt < 3:
+                    retry_status_codes.append(response.status_code)
+                    retry_after_seconds = self._retry_after_seconds(response.headers, attempt)
                     if self.logger is not None:
                         self.logger.warning(
                             "Retrying after HTTP %s for %s %s (attempt %s/4).",
@@ -343,14 +475,16 @@ class BQEHttpClient:
         raise ExportError(f"Request failed for {method} {request_url}")
 
     def _sleep_before_retry(self, headers: dict[str, str], attempt: int) -> None:
+        time.sleep(self._retry_after_seconds(headers, attempt))
+
+    def _retry_after_seconds(self, headers: dict[str, str], attempt: int) -> int:
         retry_after = headers.get("Retry-After")
         if retry_after:
             try:
-                time.sleep(max(1, int(retry_after)))
-                return
+                return max(1, int(retry_after))
             except ValueError:
                 pass
-        time.sleep(2 ** attempt)
+        return 2 ** attempt
 
 
 class BQECoreExporter:
@@ -362,6 +496,7 @@ class BQECoreExporter:
         self.token_store = TokenStore(Path(args.token_cache))
         self.incremental_state_store = IncrementalStateStore(Path(args.incremental_state_file))
         self.tokens: OAuthTokens | None = None
+        self._token_lock = threading.RLock()
         self.document_downloads: list[dict[str, Any]] = []
         self.incremental_state = self.incremental_state_store.load()
         self.incremental_field_map = _build_incremental_field_map(args)
@@ -388,6 +523,9 @@ class BQECoreExporter:
             "startedAt": _utc_now(),
             "outputDir": str(self.output_dir.resolve()),
             "pageSize": self.args.page_size,
+            "pageBatchSize": self.args.page_batch_size,
+            "adaptivePageBatching": not self.args.no_adaptive_page_batching,
+            "targetRequestsPerMinute": self.args.target_requests_per_minute,
             "downloadDocumentFiles": self.args.download_document_files,
             "logFile": str(Path(self.args.log_file).resolve()),
             "endpoints": [],
@@ -401,10 +539,13 @@ class BQECoreExporter:
             }
 
         self.logger.info(
-            "Export run started. endpoints=%s outputDir=%s pageSize=%s incremental=%s",
+            "Export run started. endpoints=%s outputDir=%s pageSize=%s pageBatchSize=%s adaptivePageBatching=%s targetRequestsPerMinute=%s incremental=%s",
             len(endpoints),
             self.output_dir.resolve(),
             self.args.page_size,
+            self.args.page_batch_size,
+            not self.args.no_adaptive_page_batching,
+            self.args.target_requests_per_minute,
             self.args.incremental,
         )
 
@@ -480,12 +621,20 @@ class BQECoreExporter:
         file_name = f"{_endpoint_to_file_name(endpoint)}.json"
         destination = self.output_dir / file_name
         writer = JsonArrayWriter(destination)
-        page_number = 1
         total_records = 0
         pages_fetched = 0
+        requested_batches = 0
         export_options = self._build_endpoint_export_options(endpoint)
+        batch_controller = self._create_page_batch_controller()
         max_watermark_value: str | None = None
         self.logger.info("Preparing endpoint export: endpoint=%s destination=%s", endpoint, destination)
+        self.logger.info(
+            "Page batching: endpoint=%s configuredBatchSize=%s adaptive=%s targetRequestsPerMinute=%s",
+            endpoint,
+            self.args.page_batch_size,
+            batch_controller.summary()["enabled"],
+            self.args.target_requests_per_minute,
+        )
         if export_options.incremental_summary:
             self.logger.info(
                 "Incremental settings: endpoint=%s field=%s previousWatermark=%s queryWatermark=%s",
@@ -495,51 +644,66 @@ class BQECoreExporter:
                 export_options.incremental_summary.get("queryWatermark"),
             )
         try:
-            while True:
-                query = self._build_query(page_number, export_options)
-                self.logger.info(
-                    "Requesting endpoint page: endpoint=%s page=%s query=%s",
-                    endpoint,
-                    page_number,
-                    json.dumps(query, sort_keys=True),
-                )
-                response = self.client.get_json(_join_url(self._api_base_url(), endpoint), query=query)
-                if response.status_code == 204:
-                    self.logger.info("Endpoint returned no content: endpoint=%s page=%s", endpoint, page_number)
-                    break
-                payload = response.json()
-                records, is_collection = _extract_records(payload)
-                if not records:
-                    self.logger.info("Endpoint returned no records: endpoint=%s page=%s", endpoint, page_number)
-                    break
-                writer.write_records(records)
-                total_records += len(records)
-                pages_fetched += 1
-                self.logger.info(
-                    "Page exported: endpoint=%s page=%s records=%s totalRecords=%s",
-                    endpoint,
-                    page_number,
-                    len(records),
-                    total_records,
-                )
-                max_watermark_value = self._max_endpoint_watermark(
-                    max_watermark_value,
-                    records,
-                    export_options.incremental_summary,
-                )
-                if self.args.download_document_files and endpoint == "document":
-                    self._download_documents(records)
-                if not is_collection or len(records) < self.args.page_size:
-                    self.logger.info(
-                        "Endpoint pagination complete: endpoint=%s page=%s isCollection=%s pageSize=%s recordsOnPage=%s",
-                        endpoint,
-                        page_number,
-                        is_collection,
-                        self.args.page_size,
-                        len(records),
-                    )
-                    break
-                page_number += 1
+            first_page_result = self._fetch_page(endpoint, 1, export_options)
+            total_records, pages_fetched, max_watermark_value, has_more_pages = self._consume_page_result(
+                endpoint,
+                first_page_result,
+                writer,
+                total_records,
+                pages_fetched,
+                max_watermark_value,
+                export_options,
+            )
+            batch_controller.observe_batch([first_page_result])
+            if has_more_pages:
+                next_page_number = 2
+                while True:
+                    batch_size = batch_controller.next_batch_size()
+                    page_numbers = list(range(next_page_number, next_page_number + batch_size))
+                    requested_batches += 1
+                    if len(page_numbers) > 1:
+                        self.logger.info(
+                            "Requesting endpoint page batch: endpoint=%s firstPage=%s lastPage=%s batchSize=%s",
+                            endpoint,
+                            page_numbers[0],
+                            page_numbers[-1],
+                            len(page_numbers),
+                        )
+                    page_results = self._fetch_page_batch(endpoint, page_numbers, export_options)
+                    should_continue = False
+                    for page_result in page_results:
+                        total_records, pages_fetched, max_watermark_value, has_more_pages = self._consume_page_result(
+                            endpoint,
+                            page_result,
+                            writer,
+                            total_records,
+                            pages_fetched,
+                            max_watermark_value,
+                            export_options,
+                        )
+                        if not has_more_pages:
+                            should_continue = False
+                            break
+                        should_continue = True
+                    previous_batch_size = batch_controller.next_batch_size()
+                    new_batch_size = batch_controller.observe_batch(page_results)
+                    if new_batch_size != previous_batch_size:
+                        self.logger.info(
+                            "Adaptive page batching adjusted: endpoint=%s previousBatchSize=%s newBatchSize=%s averagePageSeconds=%s rateLimitRemaining=%s rateLimitReset=%s",
+                            endpoint,
+                            previous_batch_size,
+                            new_batch_size,
+                            (
+                                f"{batch_controller.average_page_seconds:.3f}"
+                                if batch_controller.average_page_seconds is not None
+                                else "n/a"
+                            ),
+                            batch_controller.last_rate_limit_remaining,
+                            batch_controller.last_rate_limit_reset,
+                        )
+                    if not should_continue:
+                        break
+                    next_page_number += len(page_numbers)
         finally:
             writer.close()
 
@@ -549,6 +713,11 @@ class BQECoreExporter:
             "file": file_name,
             "records": total_records,
             "pages": pages_fetched,
+            "pageBatchSize": batch_controller.next_batch_size(),
+            "pageBatching": {
+                **batch_controller.summary(),
+                "requestedBatches": requested_batches,
+            },
         }
         if endpoint in self.auto_added_endpoints:
             endpoint_summary["autoAdded"] = True
@@ -563,6 +732,122 @@ class BQECoreExporter:
                 incremental_summary["savedWatermark"] = checkpoint_value
             endpoint_summary["incremental"] = incremental_summary
         return endpoint_summary
+
+    def _create_page_batch_controller(self) -> AdaptivePageBatchController:
+        return AdaptivePageBatchController(
+            max_batch_size=self.args.page_batch_size,
+            enabled=not self.args.no_adaptive_page_batching,
+            target_requests_per_minute=self.args.target_requests_per_minute,
+        )
+
+    def _fetch_page(
+        self,
+        endpoint: str,
+        page_number: int,
+        options: EndpointExportOptions,
+    ) -> PageFetchResult:
+        query = self._build_query(page_number, options)
+        self.logger.info(
+            "Requesting endpoint page: endpoint=%s page=%s query=%s",
+            endpoint,
+            page_number,
+            json.dumps(query, sort_keys=True),
+        )
+        response = self.client.get_json(_join_url(self._api_base_url(), endpoint), query=query)
+        if response.status_code == 204:
+            self.logger.info("Endpoint returned no content: endpoint=%s page=%s", endpoint, page_number)
+            return PageFetchResult(
+                page_number=page_number,
+                records=[],
+                is_collection=True,
+                status_code=204,
+                elapsed_seconds=response.elapsed_seconds,
+                attempt_count=response.attempt_count,
+                retry_status_codes=list(response.retry_status_codes),
+                retry_after_seconds=response.retry_after_seconds,
+                rate_limit_limit=response.rate_limit_limit,
+                rate_limit_remaining=response.rate_limit_remaining,
+                rate_limit_reset=response.rate_limit_reset,
+            )
+        payload = response.json()
+        records, is_collection = _extract_records(payload)
+        if not records:
+            self.logger.info("Endpoint returned no records: endpoint=%s page=%s", endpoint, page_number)
+        return PageFetchResult(
+            page_number=page_number,
+            records=records,
+            is_collection=is_collection,
+            status_code=response.status_code,
+            elapsed_seconds=response.elapsed_seconds,
+            attempt_count=response.attempt_count,
+            retry_status_codes=list(response.retry_status_codes),
+            retry_after_seconds=response.retry_after_seconds,
+            rate_limit_limit=response.rate_limit_limit,
+            rate_limit_remaining=response.rate_limit_remaining,
+            rate_limit_reset=response.rate_limit_reset,
+        )
+
+    def _fetch_page_batch(
+        self,
+        endpoint: str,
+        page_numbers: list[int],
+        options: EndpointExportOptions,
+    ) -> list[PageFetchResult]:
+        if len(page_numbers) == 1:
+            return [self._fetch_page(endpoint, page_numbers[0], options)]
+        max_workers = max(1, min(self.args.page_batch_size, len(page_numbers)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_by_page = {
+                executor.submit(self._fetch_page, endpoint, page_number, options): page_number
+                for page_number in page_numbers
+            }
+            results: list[PageFetchResult] = []
+            for future in concurrent.futures.as_completed(future_by_page):
+                results.append(future.result())
+        return sorted(results, key=lambda result: result.page_number)
+
+    def _consume_page_result(
+        self,
+        endpoint: str,
+        page_result: PageFetchResult,
+        writer: JsonArrayWriter,
+        total_records: int,
+        pages_fetched: int,
+        max_watermark_value: str | None,
+        export_options: EndpointExportOptions,
+    ) -> tuple[int, int, str | None, bool]:
+        if page_result.status_code == 204 or not page_result.records:
+            return total_records, pages_fetched, max_watermark_value, False
+
+        writer.write_records(page_result.records)
+        total_records += len(page_result.records)
+        pages_fetched += 1
+        self.logger.info(
+            "Page exported: endpoint=%s page=%s records=%s totalRecords=%s",
+            endpoint,
+            page_result.page_number,
+            len(page_result.records),
+            total_records,
+        )
+        max_watermark_value = self._max_endpoint_watermark(
+            max_watermark_value,
+            page_result.records,
+            export_options.incremental_summary,
+        )
+        if self.args.download_document_files and endpoint == "document":
+            self._download_documents(page_result.records)
+
+        has_more_pages = page_result.is_collection and len(page_result.records) >= self.args.page_size
+        if not has_more_pages:
+            self.logger.info(
+                "Endpoint pagination complete: endpoint=%s page=%s isCollection=%s pageSize=%s recordsOnPage=%s",
+                endpoint,
+                page_result.page_number,
+                page_result.is_collection,
+                self.args.page_size,
+                len(page_result.records),
+            )
+        return total_records, pages_fetched, max_watermark_value, has_more_pages
 
     def _build_query(self, page_number: int, options: EndpointExportOptions) -> dict[str, str]:
         query = {"page": f"{page_number},{self.args.page_size}"}
@@ -807,38 +1092,42 @@ class BQECoreExporter:
         return tokens
 
     def _refresh_tokens_if_possible(self) -> bool:
-        if self.tokens is None:
-            return False
-        if not self.tokens.refresh_token:
-            return False
-        if not self.args.client_id or not self.args.client_secret:
-            return False
-        self.logger.info("Refreshing OAuth access token.")
-        response = self.client.post_form(
-            f"{IDENTITY_BASE_URL}/connect/token",
-            {
-                "refresh_token": self.tokens.refresh_token,
-                "grant_type": "refresh_token",
-                "client_id": self.args.client_id,
-                "client_secret": self.args.client_secret,
-            },
-            include_auth=False,
-        )
-        refreshed_tokens = OAuthTokens.from_dict(response.json())
-        if not refreshed_tokens.endpoint:
-            refreshed_tokens.endpoint = self.tokens.endpoint or _normalize_base_url(self.args.api_base_url)
-        self.tokens = refreshed_tokens
-        self.token_store.save(refreshed_tokens)
-        self.logger.info("OAuth token refresh succeeded. Token cache updated: %s", self.token_store.path)
-        return True
+        with self._token_lock:
+            if self.tokens is None:
+                return False
+            if not self.tokens.refresh_token:
+                return False
+            if not self.args.client_id or not self.args.client_secret:
+                return False
+            self.logger.info("Refreshing OAuth access token.")
+            response = self.client.post_form(
+                f"{IDENTITY_BASE_URL}/connect/token",
+                {
+                    "refresh_token": self.tokens.refresh_token,
+                    "grant_type": "refresh_token",
+                    "client_id": self.args.client_id,
+                    "client_secret": self.args.client_secret,
+                },
+                include_auth=False,
+            )
+            refreshed_tokens = OAuthTokens.from_dict(response.json())
+            if not refreshed_tokens.endpoint:
+                refreshed_tokens.endpoint = self.tokens.endpoint or _normalize_base_url(self.args.api_base_url)
+            self.tokens = refreshed_tokens
+            self.token_store.save(refreshed_tokens)
+            self.logger.info("OAuth token refresh succeeded. Token cache updated: %s", self.token_store.path)
+            return True
 
     def _get_authorization_header(self) -> str | None:
-        if self.tokens is None:
-            return None
-        if self.tokens.is_expired() and self.tokens.refresh_token:
-            self.logger.info("Cached access token is expired; refreshing before request.")
-            self._refresh_tokens_if_possible()
-        return self.tokens.authorization_header()
+        with self._token_lock:
+            if self.tokens is None:
+                return None
+            if self.tokens.is_expired() and self.tokens.refresh_token:
+                self.logger.info("Cached access token is expired; refreshing before request.")
+                self._refresh_tokens_if_possible()
+            if self.tokens is None:
+                return None
+            return self.tokens.authorization_header()
 
     def _api_base_url(self) -> str:
         if self.tokens and self.tokens.endpoint:
@@ -869,6 +1158,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--endpoint", action="append", default=[])
     parser.add_argument("--endpoints-file")
     parser.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE)
+    parser.add_argument(
+        "--page-batch-size",
+        type=int,
+        default=int(os.getenv("BQE_CORE_PAGE_BATCH_SIZE", DEFAULT_PAGE_BATCH_SIZE)),
+    )
+    parser.add_argument(
+        "--target-requests-per-minute",
+        type=int,
+        default=int(os.getenv("BQE_CORE_TARGET_REQUESTS_PER_MINUTE", DEFAULT_ADAPTIVE_TARGET_REQUESTS_PER_MINUTE)),
+    )
+    parser.add_argument("--no-adaptive-page-batching", action="store_true")
     parser.add_argument("--request-timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--fields")
     parser.add_argument("--where")
@@ -1140,6 +1440,12 @@ def main() -> int:
 
     if args.page_size < 1:
         raise ExportError("--page-size must be greater than zero.")
+
+    if args.page_batch_size < 1:
+        raise ExportError("--page-batch-size must be greater than zero.")
+
+    if args.target_requests_per_minute < 1:
+        raise ExportError("--target-requests-per-minute must be greater than zero.")
 
     if args.incremental_overlap_seconds < 0:
         raise ExportError("--incremental-overlap-seconds must be zero or greater.")

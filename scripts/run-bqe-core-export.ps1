@@ -5,21 +5,25 @@ param(
     [string]$EndpointFile,
     [string]$OutputRoot,
     [string]$TokenCache,
-    [string]$ClientId = $env:BQE_CORE_CLIENT_ID,
-    [string]$ClientSecret = $env:BQE_CORE_CLIENT_SECRET,
-    [string]$RedirectUri = $env:BQE_CORE_REDIRECT_URI,
-    [string]$AccessToken = $env:BQE_CORE_ACCESS_TOKEN,
-    [string]$ApiBaseUrl = $env:BQE_CORE_API_BASE_URL,
-    [string]$Scope = $env:BQE_CORE_SCOPE,
+    [string]$EnvFile,
+    [string]$ClientId,
+    [string]$ClientSecret,
+    [string]$RedirectUri,
+    [string]$AccessToken,
+    [string]$ApiBaseUrl,
+    [string]$Scope,
     [int]$PageSize = 1000,
+    [int]$PageBatchSize = 1,
+    [int]$TargetRequestsPerMinute = 60,
     [int]$RequestTimeout = 120,
     [switch]$Incremental,
-    [string]$IncrementalStateFile = $env:BQE_CORE_INCREMENTAL_STATE_FILE,
+    [string]$IncrementalStateFile,
     [string]$IncrementalStart,
     [int]$IncrementalOverlapSeconds = 300,
     [string[]]$IncrementalField = @(),
     [switch]$NoIncrementalDeletes,
     [switch]$DownloadDocumentFiles,
+    [switch]$NoAdaptivePageBatching,
     [switch]$FailFast,
     [string[]]$AdditionalArguments = @()
 )
@@ -49,6 +53,55 @@ function Test-HasAuthMaterial {
 
 if (-not $RepoRoot) {
     $RepoRoot = Get-DefaultRepoRoot
+}
+
+$loadEnvScript = Join-Path $RepoRoot 'scripts\load-env.ps1'
+
+if (-not $EnvFile) {
+    $defaultEnvFile = Join-Path $RepoRoot '.env'
+    if (Test-Path -LiteralPath $defaultEnvFile) {
+        $EnvFile = $defaultEnvFile
+    }
+}
+
+if ($EnvFile) {
+    if (-not (Test-Path -LiteralPath $EnvFile)) {
+        throw "Environment file not found: $EnvFile"
+    }
+
+    if (-not (Test-Path -LiteralPath $loadEnvScript)) {
+        throw "Environment loader script not found: $loadEnvScript"
+    }
+
+    & $loadEnvScript -Path $EnvFile
+}
+
+if (-not $AccessToken) {
+    $AccessToken = $env:BQE_CORE_ACCESS_TOKEN
+}
+
+if (-not $ClientId) {
+    $ClientId = $env:BQE_CORE_CLIENT_ID
+}
+
+if (-not $ClientSecret) {
+    $ClientSecret = $env:BQE_CORE_CLIENT_SECRET
+}
+
+if (-not $RedirectUri) {
+    $RedirectUri = $env:BQE_CORE_REDIRECT_URI
+}
+
+if (-not $ApiBaseUrl) {
+    $ApiBaseUrl = $env:BQE_CORE_API_BASE_URL
+}
+
+if (-not $Scope) {
+    $Scope = $env:BQE_CORE_SCOPE
+}
+
+if (-not $IncrementalStateFile) {
+    $IncrementalStateFile = $env:BQE_CORE_INCREMENTAL_STATE_FILE
 }
 
 if (-not $ExporterPath) {
@@ -114,6 +167,8 @@ $arguments = @(
     '--log-file', $logPath,
     '--endpoints-file', $EndpointFile,
     '--page-size', $PageSize.ToString(),
+    '--page-batch-size', $PageBatchSize.ToString(),
+    '--target-requests-per-minute', $TargetRequestsPerMinute.ToString(),
     '--request-timeout', $RequestTimeout.ToString(),
     '--token-cache', $TokenCache,
     '--no-browser'
@@ -171,6 +226,10 @@ if ($NoIncrementalDeletes) {
 
 if ($DownloadDocumentFiles) {
     $arguments += '--download-document-files'
+}
+
+if ($NoAdaptivePageBatching) {
+    $arguments += '--no-adaptive-page-batching'
 }
 
 if ($FailFast) {
